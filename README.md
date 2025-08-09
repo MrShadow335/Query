@@ -2,6 +2,7 @@
 Running the Application
 Install dependencies:
           pip install -r requirements.txt
+          
 Set up environment:
 Create .env file with your Gemini API key
 
