@@ -656,5 +656,19 @@ async def root():
         ]
     }
 
+# At the end of main.py, update the uvicorn run configuration
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    import uvicorn
+    # Use environment variables for deployment flexibility
+    port = int(os.getenv("PORT", 8000))
+    host = os.getenv("HOST", "0.0.0.0")
+    
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=False,  # Set to False for production
+        access_log=True,
+        log_level="info"
+    )
+
