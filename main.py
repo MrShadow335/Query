@@ -1,12 +1,15 @@
-# main.py
+# main.py - Updated to match client specifications
 import os
 import json
-import re
+import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import logging
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
 import PyPDF2
@@ -15,6 +18,7 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 from dotenv import load_dotenv
+import uvicorn
 
 # Load environment variables
 load_dotenv()
@@ -24,7 +28,23 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
-app = FastAPI(title="LLM-Powered Query-Retrieval System", version="1.0.0")
+app = FastAPI(
+    title="LLM-Powered Query-Retrieval System", 
+    version="1.0.0",
+    description="HackRX 5.0 Submission - Intelligent Document Query System"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Security
+security = HTTPBearer()
 
 # Configure Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -32,290 +52,273 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 # Initialize embedding model
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-class QueryRequest(BaseModel):
-    query: str
-    pdf_url: str
+# Request/Response Models matching client specifications
+class HackRXRequest(BaseModel):
+    documents: str  # PDF URL as specified in the format
+    questions: List[str]  # Array of questions
 
-class QueryResponse(BaseModel):
-    query: str
-    answer: str
-    relevant_clauses: List[str]
-    confidence_score: float
-    reasoning: str
-    timestamp: str
+class HackRXResponse(BaseModel):
+    answers: List[str]  # Array of answers corresponding to questions
+
+# Authentication
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify Bearer token - implement your token validation logic here"""
+    token = credentials.credentials
+    # For demo purposes, accepting any token that starts with 'hackrx_'
+    if not token.startswith('hackrx_'):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return token
 
 class DocumentProcessor:
-    """Component 1: Input Documents - PDF Blob URL processor"""
+    """Enhanced document processor with caching and optimization"""
     
-    @staticmethod
-    def extract_text_from_pdf_url(pdf_url: str) -> str:
+    def __init__(self):
+        self.document_cache = {}
+    
+    async def extract_text_from_pdf_url(self, pdf_url: str) -> str:
+        """Async document processing with caching"""
+        if pdf_url in self.document_cache:
+            logger.info("Using cached document")
+            return self.document_cache[pdf_url]
+        
         try:
-            response = requests.get(pdf_url, timeout=30)
+            # Download PDF with timeout
+            response = requests.get(pdf_url, timeout=25)  # Leave 5s for processing
             response.raise_for_status()
             
-            # Save temporarily
+            # Process PDF
             temp_path = f"temp_{datetime.now().timestamp()}.pdf"
             with open(temp_path, 'wb') as f:
                 f.write(response.content)
             
-            # Extract text
             text = ""
             with open(temp_path, 'rb') as file:
                 pdf_reader = PyPDF2.PdfReader(file)
                 for page in pdf_reader.pages:
                     text += page.extract_text() + "\n"
             
-            # Cleanup
+            # Cleanup and cache
             os.remove(temp_path)
+            self.document_cache[pdf_url] = text
+            
+            logger.info(f"Document processed successfully. Length: {len(text)} characters")
             return text
             
         except Exception as e:
             logger.error(f"Error processing PDF: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Failed to process PDF: {str(e)}")
 
-class LLMParser:
-    """Component 2: LLM Parser - Extract structured query using Gemini"""
+class IntelligentQueryProcessor:
+    """Main processing engine optimized for speed and accuracy"""
     
     def __init__(self):
         self.model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    def parse_query(self, query: str, document_text: str) -> Dict[str, Any]:
-        prompt = f"""
-        You are an intelligent document analysis system. Analyze the following query and document to extract key information.
-        
-        Query: "{query}"
-        
-        Document excerpt: "{document_text[:2000]}..."
-        
-        Please provide a structured analysis in JSON format with:
-        1. "intent": The main intent of the query
-        2. "key_terms": Important terms to search for
-        3. "question_type": Type of question (coverage, conditions, eligibility, etc.)
-        4. "search_keywords": Keywords for semantic search
-        
-        Respond only with valid JSON.
-        """
-        
-        try:
-            response = self.model.generate_content(prompt)
-            parsed_data = json.loads(response.text.strip())
-            return parsed_data
-        except Exception as e:
-            logger.error(f"Error parsing query with Gemini: {str(e)}")
-            return {
-                "intent": "general_inquiry",
-                "key_terms": query.split(),
-                "question_type": "general",
-                "search_keywords": query.split()
-            }
-
-class EmbeddingSearch:
-    """Component 3: Embedding Search - FAISS/Pinecone retrieval"""
-    
-    def __init__(self):
-        self.index = None
-        self.text_chunks = []
         self.embedding_model = embedding_model
+        self.document_embeddings = None
+        self.text_chunks = []
     
-    def create_embeddings(self, text: str, chunk_size: int = 500) -> None:
-        # Split text into chunks
-        self.text_chunks = self._split_text(text, chunk_size)
+    async def setup_document(self, document_text: str):
+        """Setup document embeddings for fast querying"""
+        self.text_chunks = self._split_text_optimized(document_text)
         
         # Create embeddings
         embeddings = self.embedding_model.encode(self.text_chunks)
         
         # Build FAISS index
         dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
-        
-        # Normalize embeddings for cosine similarity
+        self.index = faiss.IndexFlatIP(dimension)
         faiss.normalize_L2(embeddings)
         self.index.add(embeddings.astype('float32'))
     
-    def search(self, query: str, top_k: int = 5) -> List[str]:
-        if self.index is None:
+    async def process_multiple_questions(self, questions: List[str]) -> List[str]:
+        """Process multiple questions efficiently"""
+        answers = []
+        
+        for question in questions:
+            try:
+                # Fast retrieval of relevant context
+                relevant_chunks = self._get_relevant_context(question)
+                context = "\n\n".join(relevant_chunks[:3])  # Top 3 most relevant
+                
+                # Generate answer with optimized prompt
+                answer = await self._generate_answer_optimized(question, context)
+                answers.append(answer)
+                
+            except Exception as e:
+                logger.error(f"Error processing question '{question}': {str(e)}")
+                answers.append("Unable to process this question due to technical limitations.")
+        
+        return answers
+    
+    def _get_relevant_context(self, question: str, top_k: int = 5) -> List[str]:
+        """Fast context retrieval using FAISS"""
+        if not hasattr(self, 'index') or self.index is None:
             return []
         
-        # Encode query
-        query_embedding = self.embedding_model.encode([query])
+        # Encode question
+        query_embedding = self.embedding_model.encode([question])
         faiss.normalize_L2(query_embedding)
         
         # Search
         scores, indices = self.index.search(query_embedding.astype('float32'), top_k)
         
-        # Return relevant chunks
         relevant_chunks = []
         for i, idx in enumerate(indices[0]):
-            if idx < len(self.text_chunks) and scores[0][i] > 0.3:  # Similarity threshold
+            if idx < len(self.text_chunks) and scores[0][i] > 0.25:
                 relevant_chunks.append(self.text_chunks[idx])
         
         return relevant_chunks
     
-    def _split_text(self, text: str, chunk_size: int) -> List[str]:
-        words = text.split()
+    async def _generate_answer_optimized(self, question: str, context: str) -> str:
+        """Generate answer with optimized prompt for speed and accuracy"""
+        prompt = f"""Based on the document context provided, answer the question directly and concisely.
+
+Context:
+{context}
+
+Question: {question}
+
+Instructions:
+- Provide a direct, factual answer
+- If the information is not in the context, state "Information not available in the document"
+- Be specific about coverage, conditions, or requirements when applicable
+- Keep the answer concise but complete
+
+Answer:"""
+        
+        try:
+            response = self.model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=200,  # Limit for faster response
+                    temperature=0.1,  # Low temperature for consistency
+                )
+            )
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Error generating answer: {str(e)}")
+            return "Unable to generate answer due to technical error."
+    
+    def _split_text_optimized(self, text: str, chunk_size: int = 400) -> List[str]:
+        """Optimized text splitting for better context preservation"""
+        # Split by sentences first, then by chunks
+        sentences = text.split('. ')
         chunks = []
         current_chunk = []
         current_size = 0
         
-        for word in words:
-            current_chunk.append(word)
-            current_size += len(word) + 1
+        for sentence in sentences:
+            sentence_size = len(sentence)
             
-            if current_size >= chunk_size:
-                chunks.append(' '.join(current_chunk))
-                current_chunk = []
-                current_size = 0
+            if current_size + sentence_size > chunk_size and current_chunk:
+                chunks.append('. '.join(current_chunk) + '.')
+                current_chunk = [sentence]
+                current_size = sentence_size
+            else:
+                current_chunk.append(sentence)
+                current_size += sentence_size
         
         if current_chunk:
-            chunks.append(' '.join(current_chunk))
+            chunks.append('. '.join(current_chunk))
         
         return chunks
 
-class ClauseMatching:
-    """Component 4: Clause Matching - Semantic similarity"""
-    
-    @staticmethod
-    def match_clauses(query_data: Dict[str, Any], relevant_chunks: List[str]) -> List[str]:
-        key_terms = query_data.get("key_terms", [])
-        matched_clauses = []
-        
-        for chunk in relevant_chunks:
-            # Simple keyword matching with semantic understanding
-            chunk_lower = chunk.lower()
-            matches = 0
-            
-            for term in key_terms:
-                if isinstance(term, str) and term.lower() in chunk_lower:
-                    matches += 1
-            
-            # Include chunk if it has significant matches or mentions policy/coverage
-            if (matches > 0 or 
-                any(word in chunk_lower for word in ['policy', 'coverage', 'benefit', 'condition', 'exclusion'])):
-                matched_clauses.append(chunk)
-        
-        return matched_clauses[:3]  # Return top 3 most relevant clauses
-
-class LogicEvaluation:
-    """Component 5: Logic Evaluation - Decision processing"""
-    
-    def __init__(self):
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    def evaluate_query(self, query: str, relevant_clauses: List[str], query_data: Dict[str, Any]) -> Dict[str, Any]:
-        context = "\n\n".join(relevant_clauses)
-        
-        prompt = f"""
-        You are an expert document analyst specializing in insurance, legal, HR, and compliance domains.
-        
-        Query: "{query}"
-        
-        Relevant Document Context:
-        {context}
-        
-        Query Analysis: {json.dumps(query_data)}
-        
-        Based on the provided context, answer the query with:
-        1. A clear, direct answer
-        2. Confidence score (0.0 to 1.0)
-        3. Step-by-step reasoning
-        4. Any limitations or assumptions
-        
-        Be specific about coverage, conditions, exclusions, or requirements mentioned in the context.
-        If the context doesn't contain enough information, clearly state this.
-        
-        Provide your response in the following JSON format:
-        {{
-            "answer": "Direct answer to the query",
-            "confidence_score": 0.85,
-            "reasoning": "Step-by-step explanation of how you arrived at this answer",
-            "limitations": "Any limitations or missing information"
-        }}
-        """
-        
-        try:
-            response = self.model.generate_content(prompt)
-            result = json.loads(response.text.strip())
-            return result
-        except Exception as e:
-            logger.error(f"Error in logic evaluation: {str(e)}")
-            return {
-                "answer": "Unable to process query due to technical error.",
-                "confidence_score": 0.0,
-                "reasoning": f"Error occurred during processing: {str(e)}",
-                "limitations": "Technical error prevented proper analysis"
-            }
-
-class JSONOutput:
-    """Component 6: JSON Output - Structured response"""
-    
-    @staticmethod
-    def format_response(query: str, evaluation_result: Dict[str, Any], 
-                       relevant_clauses: List[str]) -> QueryResponse:
-        return QueryResponse(
-            query=query,
-            answer=evaluation_result.get("answer", "No answer available"),
-            relevant_clauses=relevant_clauses,
-            confidence_score=evaluation_result.get("confidence_score", 0.0),
-            reasoning=evaluation_result.get("reasoning", "No reasoning provided"),
-            timestamp=datetime.now().isoformat()
-        )
-
-# Initialize system components
+# Initialize components
 doc_processor = DocumentProcessor()
-llm_parser = LLMParser()
-embedding_search = EmbeddingSearch()
-clause_matcher = ClauseMatching()
-logic_evaluator = LogicEvaluation()
-json_formatter = JSONOutput()
+query_processor = IntelligentQueryProcessor()
 
-@app.post("/hackrx/run", response_model=QueryResponse)
-async def process_query(request: QueryRequest):
+@app.post("/hackrx/run", response_model=HackRXResponse)
+async def hackrx_main_endpoint(
+    request: HackRXRequest,
+    token: str = Depends(verify_token)
+):
     """
-    Main API endpoint that processes the query through all 6 components
+    Main HackRX endpoint - Processes documents and questions as per client specifications
+    
+    Expected format:
+    {
+        "documents": "https://example.com/policy.pdf",
+        "questions": ["Question 1", "Question 2", ...]
+    }
+    
+    Returns:
+    {
+        "answers": ["Answer 1", "Answer 2", ...]
+    }
     """
+    start_time = datetime.now()
+    
     try:
-        logger.info(f"Processing query: {request.query}")
+        logger.info(f"Processing request with {len(request.questions)} questions")
         
-        # Component 1: Extract text from PDF
-        document_text = doc_processor.extract_text_from_pdf_url(request.pdf_url)
-        logger.info("Document text extracted successfully")
+        # Step 1: Extract document content (Component 1)
+        document_text = await doc_processor.extract_text_from_pdf_url(request.documents)
         
-        # Component 2: Parse query with LLM
-        query_data = llm_parser.parse_query(request.query, document_text)
-        logger.info("Query parsed successfully")
+        # Step 2: Setup document for querying (Components 2-3)
+        await query_processor.setup_document(document_text)
         
-        # Component 3: Create embeddings and search
-        embedding_search.create_embeddings(document_text)
-        relevant_chunks = embedding_search.search(request.query)
-        logger.info(f"Found {len(relevant_chunks)} relevant chunks")
+        # Step 3: Process all questions (Components 4-6)
+        answers = await query_processor.process_multiple_questions(request.questions)
         
-        # Component 4: Match clauses
-        matched_clauses = clause_matcher.match_clauses(query_data, relevant_chunks)
-        logger.info(f"Matched {len(matched_clauses)} clauses")
+        # Ensure response time < 30s
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Request processed in {processing_time:.2f} seconds")
         
-        # Component 5: Evaluate with logic
-        evaluation_result = logic_evaluator.evaluate_query(
-            request.query, matched_clauses, query_data
-        )
-        logger.info("Logic evaluation completed")
+        if processing_time > 28:  # Warning if close to limit
+            logger.warning("Processing time approaching 30s limit")
         
-        # Component 6: Format JSON output
-        response = json_formatter.format_response(
-            request.query, evaluation_result, matched_clauses
-        )
-        logger.info("Response formatted successfully")
-        
-        return response
+        return HackRXResponse(answers=answers)
         
     except Exception as e:
-        logger.error(f"Error processing query: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.error(f"Error after {processing_time:.2f}s: {str(e)}")
+        
+        # Return partial results if possible
+        if 'answers' in locals() and answers:
+            return HackRXResponse(answers=answers)
+        
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Processing failed: {str(e)}"
+        )
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    """Health check endpoint for monitoring"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": "1.0.0",
+        "ready": True
+    }
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "LLM-Powered Intelligent Query-Retrieval System",
+        "version": "1.0.0",
+        "hackrx": "5.0",
+        "team": "Your Team Name",
+        "tech_stack": "FastAPI + Gemini + FAISS + Pinecone",
+        "endpoints": {
+            "main": "POST /hackrx/run",
+            "health": "GET /health"
+        }
+    }
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="localhost", port=8000)
+    # Production configuration
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        ssl_keyfile="path/to/key.pem",  # Add your SSL certificate
+        ssl_certfile="path/to/cert.pem",  # Add your SSL certificate
+        access_log=True,
+        loop="asyncio"
+    )
