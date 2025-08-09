@@ -1,6 +1,7 @@
 # Query
 Running the Application
-Install dependencies:
+Install dependencies
+
           pip install -r requirements.txt
           
 Set up environment:
