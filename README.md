@@ -7,4 +7,4 @@ Install dependencies
 Set up environment:
 Create .env file with your Gemini API key
 
-      echo "GEMINI_API_KEY=your_actual_gemini_api_key" > .env
+          echo "GEMINI_API_KEY=your_actual_gemini_api_key" > .env
